@@ -1,0 +1,318 @@
+import { pool } from '../config/database.js';
+import { buscarClientePorUsuario } from '../models/cliente.model.js';
+import {
+  buscarMembresiaPorId,
+  cancelarMembresia,
+  editarMembresia,
+  listarMembresiasPorCliente,
+  listarMembresiasPorUsuario,
+  listarTodasMembresias,
+  registrarMembresia,
+  registrarMembresiaConPago
+} from '../models/membresia.model.js';
+import { METODOS_PERMITIDOS, ESTADOS_PERMITIDOS } from './pago.controller.js';
+import { errorResponse, successResponse } from '../utils/api-response.js';
+
+export async function crearMembresia(req, res, next) {
+  const { fk_cliente, fk_plan, fecha_inicio, pago } = req.body;
+
+  const idCliente = Number(fk_cliente);
+  const idPlan = Number(fk_plan);
+
+  if (isNaN(idCliente) || idCliente <= 0) {
+    return errorResponse(res, 400, 'El ID de cliente (fk_cliente) no es válido', 'VALIDATION_ERROR');
+  }
+
+  if (isNaN(idPlan) || idPlan <= 0) {
+    return errorResponse(res, 400, 'El ID de plan (fk_plan) no es válido', 'VALIDATION_ERROR');
+  }
+
+  if (fecha_inicio !== undefined && fecha_inicio !== null && fecha_inicio !== '') {
+    const fechaRegex = /^\d{4}-\d{2}-\d{2}$/;
+    if (!fechaRegex.test(String(fecha_inicio)) || isNaN(Date.parse(fecha_inicio))) {
+      return errorResponse(
+        res,
+        400,
+        "La fecha de inicio debe tener el formato válido 'YYYY-MM-DD'",
+        'VALIDATION_ERROR'
+      );
+    }
+  }
+
+  let pagoValidado = null;
+  if (pago !== undefined && pago !== null) {
+    if (typeof pago !== 'object' || Array.isArray(pago)) {
+      return errorResponse(res, 400, 'El objeto "pago" no es válido', 'VALIDATION_ERROR');
+    }
+
+    if (!METODOS_PERMITIDOS.includes(pago.metodo_pago)) {
+      return errorResponse(
+        res,
+        400,
+        `El método de pago no es válido. Opciones permitidas: ${METODOS_PERMITIDOS.join(', ')}`,
+        'VALIDATION_ERROR'
+      );
+    }
+
+    let estadoPagoFinal = 'Pagado';
+    if (pago.estado_pago !== undefined && pago.estado_pago !== null && String(pago.estado_pago).trim() !== '') {
+      if (!ESTADOS_PERMITIDOS.includes(pago.estado_pago)) {
+        return errorResponse(
+          res,
+          400,
+          `El estado de pago no es válido. Opciones permitidas: ${ESTADOS_PERMITIDOS.join(', ')}`,
+          'VALIDATION_ERROR'
+        );
+      }
+      estadoPagoFinal = pago.estado_pago;
+    }
+
+    pagoValidado = { metodo_pago: pago.metodo_pago, estado_pago: estadoPagoFinal };
+  }
+
+  try {
+    if (pagoValidado) {
+      const resultado = await registrarMembresiaConPago({
+        fk_cliente: idCliente,
+        fk_plan: idPlan,
+        fecha_inicio,
+        pago: pagoValidado
+      });
+
+      return successResponse(res, 201, 'Membresía y pago registrados exitosamente', {
+        ...resultado.membresia,
+        pago: resultado.pago
+      });
+    }
+
+    const membresia = await registrarMembresia({
+      fk_cliente: idCliente,
+      fk_plan: idPlan,
+      fecha_inicio
+    });
+
+    return successResponse(res, 201, 'Membresía asignada exitosamente', membresia);
+  } catch (error) {
+    if (error.code === 'CLIENT_NOT_FOUND') {
+      return errorResponse(res, 404, error.message, error.code);
+    }
+    if (error.code === 'INACTIVE_USER') {
+      return errorResponse(res, 400, error.message, error.code);
+    }
+    if (error.code === 'INVALID_ROLE') {
+      return errorResponse(res, 400, error.message, error.code);
+    }
+    if (error.code === 'PLAN_NOT_FOUND') {
+      return errorResponse(res, 404, error.message, error.code);
+    }
+    if (error.code === 'PLAN_INACTIVE') {
+      return errorResponse(res, 400, error.message, error.code);
+    }
+    if (error.code === 'ACTIVE_MEMBERSHIP_EXISTS') {
+      return errorResponse(res, 400, error.message, error.code, {
+        fecha_vencimiento: error.fecha_vencimiento
+      });
+    }
+    return next(error);
+  }
+}
+
+export async function obtenerHistorialUsuario(req, res, next) {
+  try {
+    const idUsuario = Number(req.params.id_usuario);
+    if (isNaN(idUsuario) || idUsuario <= 0) {
+      return errorResponse(res, 400, 'El ID de usuario no es válido', 'INVALID_ID');
+    }
+
+    // Regla de autorización: Administrador puede consultar cualquier usuario;
+    // un Cliente solo puede consultar su propio historial basado en su id_usuario de sesión.
+    const usuarioAuth = req.usuarioAutenticado;
+    if (usuarioAuth?.nombre_rol !== 'Administrador' && usuarioAuth?.id_usuario !== idUsuario) {
+      return errorResponse(
+        res,
+        403,
+        'No tienes permisos para consultar las membresías de otro usuario',
+        'FORBIDDEN'
+      );
+    }
+
+    const resultado = await listarMembresiasPorUsuario(idUsuario);
+
+    const membresiaActiva = resultado.historial.find((m) => m.vigencia === 'Activa') || null;
+
+    return successResponse(res, 200, 'Historial de membresías obtenido correctamente', {
+      cliente: resultado.cliente,
+      tiene_membresia_activa: Boolean(membresiaActiva),
+      membresia_activa: membresiaActiva,
+      historial: resultado.historial
+    });
+  } catch (error) {
+    if (error.code === 'USER_NOT_FOUND') {
+      return errorResponse(res, 404, error.message, error.code);
+    }
+    if (error.code === 'CLIENT_PROFILE_NOT_FOUND') {
+      return errorResponse(res, 404, error.message, error.code);
+    }
+    return next(error);
+  }
+}
+
+export async function obtenerHistorialCliente(req, res, next) {
+  try {
+    const idCliente = Number(req.params.id_cliente);
+    if (isNaN(idCliente) || idCliente <= 0) {
+      return errorResponse(res, 400, 'El ID de cliente no es válido', 'INVALID_ID');
+    }
+
+    const resultado = await listarMembresiasPorCliente(idCliente);
+    if (!resultado) {
+      return errorResponse(res, 404, 'Cliente no encontrado', 'CLIENT_NOT_FOUND');
+    }
+
+    const membresiaActiva = resultado.historial.find((m) => m.vigencia === 'Activa') || null;
+
+    return successResponse(res, 200, 'Historial de membresías obtenido correctamente', {
+      cliente: resultado.cliente,
+      tiene_membresia_activa: Boolean(membresiaActiva),
+      membresia_activa: membresiaActiva,
+      historial: resultado.historial
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+export async function obtenerTodasMembresias(req, res, next) {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 100, 200);
+    const offset = Math.max(Number(req.query.offset) || 0, 0);
+
+    const membresias = await listarTodasMembresias({ limit, offset });
+    return successResponse(res, 200, 'Membresías obtenidas correctamente', membresias);
+  } catch (error) {
+    return next(error);
+  }
+}
+
+export async function cancelarMembresiaController(req, res, next) {
+  try {
+    const idMembresia = Number(req.params.id);
+    if (isNaN(idMembresia) || idMembresia <= 0) {
+      return errorResponse(res, 400, 'El ID de la membresía no es válido', 'INVALID_ID');
+    }
+
+    const membresiaExistente = await buscarMembresiaPorId(idMembresia);
+    if (!membresiaExistente) {
+      return errorResponse(res, 404, 'Membresía no encontrada', 'MEMBERSHIP_NOT_FOUND');
+    }
+
+    const usuarioAuth = req.usuarioAutenticado;
+
+    // Si el usuario autenticado es un Cliente:
+    if (usuarioAuth?.nombre_rol === 'Cliente') {
+      const perfilCliente = await buscarClientePorUsuario(usuarioAuth.id_usuario);
+      if (!perfilCliente || perfilCliente.id_cliente !== membresiaExistente.fk_cliente) {
+        return errorResponse(
+          res,
+          403,
+          'No tienes permisos para cancelar una membresía que no te pertenece',
+          'FORBIDDEN'
+        );
+      }
+
+      if (membresiaExistente.estado_membresia !== 'Activa') {
+        return errorResponse(
+          res,
+          400,
+          `Solo es posible cancelar membresías con estado "Activa". La membresía actual está "${membresiaExistente.estado_membresia}".`,
+          'MEMBERSHIP_NOT_ACTIVE'
+        );
+      }
+
+      // Validar ventana de cancelación: del día 1 al día 5 del mes
+      const [filasFecha] = await pool.execute('SELECT DAY(CURDATE()) as dia_actual');
+      const diaActual = Number(filasFecha[0]?.dia_actual);
+
+      if (diaActual < 1 || diaActual > 5) {
+        return errorResponse(
+          res,
+          400,
+          `Las solicitudes de cancelación de plan solo pueden realizarse del 1 al 5 de cada mes. Hoy es día ${diaActual}.`,
+          'CANCELLATION_WINDOW_CLOSED',
+          { dia_actual: diaActual, ventana_permitida: '1 al 5' }
+        );
+      }
+    }
+
+    const cancelada = await cancelarMembresia(idMembresia);
+    return successResponse(res, 200, 'Membresía cancelada correctamente', cancelada);
+  } catch (error) {
+    return next(error);
+  }
+}
+
+export async function editarMembresiaController(req, res, next) {
+  try {
+    const idMembresia = Number(req.params.id);
+    if (isNaN(idMembresia) || idMembresia <= 0) {
+      return errorResponse(res, 400, 'El ID de la membresía no es válido', 'INVALID_ID');
+    }
+
+    const { fk_plan, fecha_inicio } = req.body;
+
+    // Debe llegarse al menos un campo a editar
+    if (fk_plan === undefined && fecha_inicio === undefined) {
+      return errorResponse(
+        res,
+        400,
+        'Debes enviar al menos uno de los campos: fk_plan o fecha_inicio',
+        'VALIDATION_ERROR'
+      );
+    }
+
+    // Validar fk_plan si se envía
+    if (fk_plan !== undefined) {
+      const idPlan = Number(fk_plan);
+      if (isNaN(idPlan) || idPlan <= 0) {
+        return errorResponse(res, 400, 'El ID de plan (fk_plan) no es válido', 'VALIDATION_ERROR');
+      }
+    }
+
+    // Validar formato de fecha_inicio si se envía (YYYY-MM-DD)
+    if (fecha_inicio !== undefined && fecha_inicio !== null && fecha_inicio !== '') {
+      const fechaRegex = /^\d{4}-\d{2}-\d{2}$/;
+      if (!fechaRegex.test(String(fecha_inicio)) || isNaN(Date.parse(fecha_inicio))) {
+        return errorResponse(
+          res,
+          400,
+          "La fecha de inicio debe tener el formato válido 'YYYY-MM-DD'",
+          'VALIDATION_ERROR'
+        );
+      }
+    }
+
+    const membresiaActualizada = await editarMembresia(idMembresia, { fk_plan, fecha_inicio });
+
+    if (!membresiaActualizada) {
+      return errorResponse(res, 404, 'Membresía no encontrada', 'MEMBERSHIP_NOT_FOUND');
+    }
+
+    return successResponse(res, 200, 'Membresía actualizada correctamente', membresiaActualizada);
+  } catch (error) {
+    if (error.code === 'MEMBERSHIP_CANCELLED') {
+      return errorResponse(res, 400, error.message, error.code);
+    }
+    if (error.code === 'PLAN_NOT_FOUND') {
+      return errorResponse(res, 404, error.message, error.code);
+    }
+    if (error.code === 'PLAN_INACTIVE') {
+      return errorResponse(res, 400, error.message, error.code);
+    }
+    if (error.code === 'ACTIVE_MEMBERSHIP_EXISTS') {
+      return errorResponse(res, 400, error.message, error.code, {
+        fecha_vencimiento: error.fecha_vencimiento
+      });
+    }
+    return next(error);
+  }
+}
